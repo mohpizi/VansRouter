@@ -1267,10 +1267,14 @@ export default function ProviderDetailPage() {
   const [batchTestingModels, setBatchTestingModels] = useState(false);
   const [batchModelProgress, setBatchModelProgress] = useState(null);
   const [autoDisableBatchFailed, setAutoDisableBatchFailed] = useState(false);
+  const [parallelTestMode, setParallelTestMode] = useState(false);
+  const [batchTestingIds, setBatchTestingIds] = useState(() => new Set());
   const autoDisableFailedRef = useRef(false);
+  const parallelModeRef = useRef(false);
   const batchAbortRef = useRef(null);
 
-  // Free-tier upstreams tolerate parallel pings (user-verified) — fire all at once.
+  // Mode per-model sequential with a parallel toggle; parallel skips the
+  // concurrency cap entirely (free tier upstreams tolerate it).
   const handleBatchTestModels = async (models) => {
     if (batchTestingModels || models.length === 0) return;
     const controller = new AbortController();
@@ -1279,8 +1283,11 @@ export default function ProviderDetailPage() {
     let ok = 0;
     let failed = 0;
     let done = 0;
+    const tick = () => setBatchModelProgress({ done, total: models.length, ok, failed });
     setBatchModelProgress({ done: 0, total: models.length, ok, failed });
-    await Promise.all(models.map(async ({ id }) => {
+    const testOne = async (id) => {
+      if (controller.signal.aborted) return;
+      setBatchTestingIds((prev) => { const n = new Set(prev); n.add(id); return n; });
       try {
         const res = await fetch("/api/models/test", {
           method: "POST",
@@ -1296,14 +1303,24 @@ export default function ProviderDetailPage() {
         }
         setModelTestResults((prev) => ({ ...prev, [id]: data.ok ? "ok" : "error" }));
       } catch (error) {
-        if (error?.name === "AbortError") return; // stopped — leave chip untested
+        if (error?.name === "AbortError") return;
         failed += 1;
         if (autoDisableFailedRef.current) await handleDisableModel(id);
         setModelTestResults((prev) => ({ ...prev, [id]: "error" }));
+      } finally {
+        setBatchTestingIds((prev) => { const n = new Set(prev); n.delete(id); return n; });
       }
       done += 1;
-      setBatchModelProgress({ done, total: models.length, ok, failed });
-    }));
+      tick();
+    };
+    if (parallelModeRef.current) {
+      await Promise.all(models.map(({ id }) => testOne(id)));
+    } else {
+      for (const { id } of models) {
+        if (controller.signal.aborted) break;
+        await testOne(id);
+      }
+    }
     setBatchTestingModels(false);
   };
 
@@ -1397,6 +1414,18 @@ export default function ProviderDetailPage() {
             <label className="flex items-center gap-1.5 text-xs text-text-muted cursor-pointer">
               <input
                 type="checkbox"
+                checked={parallelTestMode}
+                onChange={(e) => {
+                  setParallelTestMode(e.target.checked);
+                  parallelModeRef.current = e.target.checked;
+                }}
+                className="accent-[var(--color-primary)]"
+              />
+              Parallel
+            </label>
+            <label className="flex items-center gap-1.5 text-xs text-text-muted cursor-pointer">
+              <input
+                type="checkbox"
                 checked={autoDisableBatchFailed}
                 onChange={(e) => {
                   setAutoDisableBatchFailed(e.target.checked);
@@ -1427,7 +1456,7 @@ export default function ProviderDetailPage() {
             }}
             testStatus={modelTestResults[model.id]}
             onTest={connections.length > 0 || isFreeNoAuth ? () => handleTestModel(model.id) : undefined}
-            isTesting={testingModelIds.has(model.id)}
+            isTesting={testingModelIds.has(model.id) || batchTestingIds.has(model.id)}
             isCustom
             isFree={false}
             caps={getCaps(`${providerId}/${model.id}`)}
@@ -1453,7 +1482,7 @@ export default function ProviderDetailPage() {
               onDeleteAlias={() => handleDeleteAlias(existingAlias)}
               testStatus={modelTestResults[model.id]}
               onTest={connections.length > 0 || isFreeNoAuth ? () => handleTestModel(model.id) : undefined}
-              isTesting={testingModelIds.has(model.id)}
+              isTesting={testingModelIds.has(model.id) || batchTestingIds.has(model.id)}
               isFree={model.isFree}
               onDisable={() => handleDisableModel(model.id)}
               caps={getCaps(`${providerId}/${model.id}`)}
