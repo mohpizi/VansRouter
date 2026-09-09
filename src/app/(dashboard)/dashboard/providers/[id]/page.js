@@ -1267,37 +1267,43 @@ export default function ProviderDetailPage() {
   const [batchTestingModels, setBatchTestingModels] = useState(false);
   const [batchModelProgress, setBatchModelProgress] = useState(null);
   const [autoDisableBatchFailed, setAutoDisableBatchFailed] = useState(false);
-  const stopBatchModelsRef = useRef(false);
+  const autoDisableFailedRef = useRef(false);
+  const batchAbortRef = useRef(null);
 
+  // Free-tier upstreams tolerate parallel pings (user-verified) — fire all at once.
   const handleBatchTestModels = async (models) => {
     if (batchTestingModels || models.length === 0) return;
-    stopBatchModelsRef.current = false;
+    const controller = new AbortController();
+    batchAbortRef.current = controller;
     setBatchTestingModels(true);
-    setBatchModelProgress({ done: 0, total: models.length, ok: 0, failed: 0 });
     let ok = 0;
     let failed = 0;
-    for (const { id } of models) {
-      if (stopBatchModelsRef.current) break;
+    let done = 0;
+    setBatchModelProgress({ done: 0, total: models.length, ok, failed });
+    await Promise.all(models.map(async ({ id }) => {
       try {
         const res = await fetch("/api/models/test", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ model: `${providerStorageAlias}/${id}` }),
+          signal: controller.signal,
         });
         const data = await res.json();
         if (data.ok) ok += 1;
         else {
           failed += 1;
-          if (autoDisableBatchFailed) await handleDisableModel(id);
+          if (autoDisableFailedRef.current) await handleDisableModel(id);
         }
         setModelTestResults((prev) => ({ ...prev, [id]: data.ok ? "ok" : "error" }));
-      } catch {
+      } catch (error) {
+        if (error?.name === "AbortError") return; // stopped — leave chip untested
         failed += 1;
-        if (autoDisableBatchFailed) await handleDisableModel(id);
+        if (autoDisableFailedRef.current) await handleDisableModel(id);
         setModelTestResults((prev) => ({ ...prev, [id]: "error" }));
       }
-      setBatchModelProgress({ done: ok + failed, total: models.length, ok, failed });
-    }
+      done += 1;
+      setBatchModelProgress({ done, total: models.length, ok, failed });
+    }));
     setBatchTestingModels(false);
   };
 
@@ -1352,7 +1358,6 @@ export default function ProviderDetailPage() {
     const disabledSet = new Set(disabledModelIds);
     const displayModels = allModels.filter((m) => !disabledSet.has(m.id));
     const disabledDisplayModels = allModels.filter((m) => disabledSet.has(m.id));
-    const activeModelList = displayModels.map((m) => ({ id: m.id }));
     const customModelRows = getProviderCustomModelRows({
       customModels,
       modelAliases,
@@ -1360,6 +1365,14 @@ export default function ProviderDetailPage() {
       builtInModels: models,
       type: "llm",
     });
+    // Disabled filter must cover custom/alias chips too, not just built-in models
+    const activeCustomRows = customModelRows.filter((m) => !disabledSet.has(m.id));
+    const disabledCustomRows = customModelRows.filter((m) => disabledSet.has(m.id));
+    // Batch test must cover every chip shown: custom/alias models + built-in active models
+    const activeModelList = [
+      ...activeCustomRows.map((m) => ({ id: m.id })),
+      ...displayModels.filter((m) => !customModelRows.some((cm) => cm.id === m.id)).map((m) => ({ id: m.id })),
+    ];
 
     return (
       <div className="flex flex-wrap gap-3">
@@ -1371,7 +1384,7 @@ export default function ProviderDetailPage() {
               icon={batchTestingModels ? "stop" : "science"}
               loading={batchTestingModels}
               onClick={batchTestingModels
-                ? () => { stopBatchModelsRef.current = true; }
+                ? () => batchAbortRef.current?.abort()
                 : () => handleBatchTestModels(activeModelList)}
             >
               {batchTestingModels ? "Stop" : "Test All Models"}
@@ -1385,7 +1398,10 @@ export default function ProviderDetailPage() {
               <input
                 type="checkbox"
                 checked={autoDisableBatchFailed}
-                onChange={(e) => setAutoDisableBatchFailed(e.target.checked)}
+                onChange={(e) => {
+                  setAutoDisableBatchFailed(e.target.checked);
+                  autoDisableFailedRef.current = e.target.checked;
+                }}
                 className="accent-[var(--color-primary)]"
               />
               Auto-disable failed
@@ -1393,7 +1409,7 @@ export default function ProviderDetailPage() {
           </div>
         )}
         {/* Custom models first */}
-        {customModelRows.map((model) => (
+        {activeCustomRows.map((model) => (
           <ModelRow
             key={`${model.source}-${model.fullModel}`}
             model={{ id: model.id, name: model.name }}
@@ -1488,12 +1504,12 @@ export default function ProviderDetailPage() {
           );
         })()}
 
-        {/* Disabled models — restorable */}
-        {disabledDisplayModels.length > 0 && (
+        {/* Disabled models — restorable (built-in + custom/alias) */}
+        {[...disabledDisplayModels, ...disabledCustomRows].length > 0 && (
           <div className="w-full mt-2">
-            <p className="text-xs text-text-muted mb-2">Disabled models ({disabledDisplayModels.length}):</p>
+            <p className="text-xs text-text-muted mb-2">Disabled models ({disabledDisplayModels.length + disabledCustomRows.length}):</p>
             <div className="flex flex-wrap gap-2">
-              {disabledDisplayModels.map((m) => (
+              {[...disabledDisplayModels, ...disabledCustomRows].map((m) => (
                 <button
                   key={m.id}
                   onClick={() => handleEnableModel(m.id)}
