@@ -1264,6 +1264,43 @@ export default function ProviderDetailPage() {
     </Modal>
   );
 
+  const [batchTestingModels, setBatchTestingModels] = useState(false);
+  const [batchModelProgress, setBatchModelProgress] = useState(null);
+  const [autoDisableBatchFailed, setAutoDisableBatchFailed] = useState(false);
+  const stopBatchModelsRef = useRef(false);
+
+  const handleBatchTestModels = async (models) => {
+    if (batchTestingModels || models.length === 0) return;
+    stopBatchModelsRef.current = false;
+    setBatchTestingModels(true);
+    setBatchModelProgress({ done: 0, total: models.length, ok: 0, failed: 0 });
+    let ok = 0;
+    let failed = 0;
+    for (const { id } of models) {
+      if (stopBatchModelsRef.current) break;
+      try {
+        const res = await fetch("/api/models/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: `${providerStorageAlias}/${id}` }),
+        });
+        const data = await res.json();
+        if (data.ok) ok += 1;
+        else {
+          failed += 1;
+          if (autoDisableBatchFailed) await handleDisableModel(id);
+        }
+        setModelTestResults((prev) => ({ ...prev, [id]: data.ok ? "ok" : "error" }));
+      } catch {
+        failed += 1;
+        if (autoDisableBatchFailed) await handleDisableModel(id);
+        setModelTestResults((prev) => ({ ...prev, [id]: "error" }));
+      }
+      setBatchModelProgress({ done: ok + failed, total: models.length, ok, failed });
+    }
+    setBatchTestingModels(false);
+  };
+
   const handleTestModel = async (modelId) => {
     if (testingModelIds.has(modelId)) return;
     setTestingModelIds((prev) => new Set(prev).add(modelId));
@@ -1315,6 +1352,7 @@ export default function ProviderDetailPage() {
     const disabledSet = new Set(disabledModelIds);
     const displayModels = allModels.filter((m) => !disabledSet.has(m.id));
     const disabledDisplayModels = allModels.filter((m) => disabledSet.has(m.id));
+    const activeModelList = displayModels.map((m) => ({ id: m.id }));
     const customModelRows = getProviderCustomModelRows({
       customModels,
       modelAliases,
@@ -1325,6 +1363,35 @@ export default function ProviderDetailPage() {
 
     return (
       <div className="flex flex-wrap gap-3">
+        {activeModelList.length > 0 && (
+          <div className="w-full flex items-center gap-3 flex-wrap mb-1">
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={batchTestingModels ? "stop" : "science"}
+              loading={batchTestingModels}
+              onClick={batchTestingModels
+                ? () => { stopBatchModelsRef.current = true; }
+                : () => handleBatchTestModels(activeModelList)}
+            >
+              {batchTestingModels ? "Stop" : "Test All Models"}
+            </Button>
+            {batchTestingModels && batchModelProgress && (
+              <span className="text-xs text-text-muted">
+                {batchModelProgress.done}/{batchModelProgress.total} — {batchModelProgress.ok} ok, {batchModelProgress.failed} error
+              </span>
+            )}
+            <label className="flex items-center gap-1.5 text-xs text-text-muted cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoDisableBatchFailed}
+                onChange={(e) => setAutoDisableBatchFailed(e.target.checked)}
+                className="accent-[var(--color-primary)]"
+              />
+              Auto-disable failed
+            </label>
+          </div>
+        )}
         {/* Custom models first */}
         {customModelRows.map((model) => (
           <ModelRow
