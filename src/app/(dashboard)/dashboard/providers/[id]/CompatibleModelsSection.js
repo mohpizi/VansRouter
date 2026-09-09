@@ -88,7 +88,12 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
   const [batchTesting, setBatchTesting] = useState(false);
   const [batchProgress, setBatchProgress] = useState(null);
   const [autoDisableFailed, setAutoDisableFailed] = useState(false);
+  const [parallelMode, setParallelMode] = useState(false);
+  const [batchTestingIds, setBatchTestingIds] = useState(() => new Set());
+  const autoDisableRef = useRef(false);
+  const parallelRef = useRef(false);
   const stopBatchRef = useRef(false);
+  const batchAbortRef = useRef(null);
 
   const handleTestModel = async (modelId) => {
     if (testingModelId || batchTesting) return;
@@ -175,33 +180,50 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
 
   const handleBatchTest = async () => {
     if (batchTesting || activeModels.length === 0) return;
+    const controller = new AbortController();
+    batchAbortRef.current = controller;
     stopBatchRef.current = false;
     setBatchTesting(true);
-    setBatchProgress({ done: 0, total: activeModels.length, ok: 0, failed: 0 });
     let ok = 0;
     let failed = 0;
-    for (let i = 0; i < activeModels.length; i++) {
-      if (stopBatchRef.current) break;
-      const { id } = activeModels[i];
+    let done = 0;
+    const tick = () => setBatchProgress({ done, total: activeModels.length, ok, failed });
+    setBatchProgress({ done: 0, total: activeModels.length, ok, failed });
+    const testOne = async (id) => {
+      if (controller.signal.aborted) return;
+      setBatchTestingIds((prev) => { const n = new Set(prev); n.add(id); return n; });
       try {
         const res = await fetch("/api/models/test", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ model: `${providerStorageAlias}/${id}` }),
+          signal: controller.signal,
         });
         const data = await res.json();
         if (data.ok) ok += 1;
         else {
           failed += 1;
-          if (autoDisableFailed && onDisableModel) await onDisableModel(id);
+          if (autoDisableRef.current && onDisableModel) await onDisableModel(id);
         }
         setModelTestResults((prev) => ({ ...prev, [id]: data.ok ? "ok" : "error" }));
-      } catch {
+      } catch (error) {
+        if (error?.name === "AbortError") return;
         failed += 1;
-        if (autoDisableFailed && onDisableModel) await onDisableModel(id);
+        if (autoDisableRef.current && onDisableModel) await onDisableModel(id);
         setModelTestResults((prev) => ({ ...prev, [id]: "error" }));
+      } finally {
+        setBatchTestingIds((prev) => { const n = new Set(prev); n.delete(id); return n; });
       }
-      setBatchProgress({ done: i + 1, total: activeModels.length, ok, failed });
+      done += 1;
+      tick();
+    };
+    if (parallelRef.current) {
+      await Promise.all(activeModels.map(({ id }) => testOne(id)));
+    } else {
+      for (const { id } of activeModels.map((m) => m)) {
+        if (controller.signal.aborted) break;
+        await testOne(id);
+      }
     }
     setBatchTesting(false);
   };
@@ -239,7 +261,7 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
             variant="secondary"
             icon={batchTesting ? "stop" : "science"}
             loading={batchTesting}
-            onClick={batchTesting ? () => { stopBatchRef.current = true; } : handleBatchTest}
+            onClick={batchTesting ? () => batchAbortRef.current?.abort() : handleBatchTest}
           >
             {batchTesting ? "Stop" : "Test All Models"}
           </Button>
@@ -250,12 +272,29 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
             {batchProgress.done}/{batchProgress.total} — {batchProgress.ok} ok, {batchProgress.failed} error
           </span>
         )}
+        {activeModels.length > 0 && (
+          <label className="flex items-center gap-1.5 text-xs text-text-muted cursor-pointer pb-1.5 whitespace-nowrap">
+            <input
+              type="checkbox"
+              checked={parallelMode}
+              onChange={(e) => {
+                setParallelMode(e.target.checked);
+                parallelRef.current = e.target.checked;
+              }}
+              className="accent-[var(--color-primary)]"
+            />
+            Parallel
+          </label>
+        )}
         {activeModels.length > 0 && onDisableModel && (
           <label className="flex items-center gap-1.5 text-xs text-text-muted cursor-pointer pb-1.5 whitespace-nowrap">
             <input
               type="checkbox"
               checked={autoDisableFailed}
-              onChange={(e) => setAutoDisableFailed(e.target.checked)}
+              onChange={(e) => {
+                setAutoDisableFailed(e.target.checked);
+                autoDisableRef.current = e.target.checked;
+              }}
               className="accent-[var(--color-primary)]"
             />
             Auto-disable failed
@@ -281,7 +320,7 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
               onDeleteAlias={() => source === "custom" ? onDeleteCustomModel(id) : onDeleteAlias(alias)}
               onTest={connections.length > 0 ? () => handleTestModel(id) : undefined}
               testStatus={modelTestResults[id]}
-              isTesting={testingModelId === id}
+              isTesting={testingModelId === id || batchTestingIds.has(id)}
               onDisable={onDisableModel ? () => onDisableModel(id) : undefined}
             />
           ))}
