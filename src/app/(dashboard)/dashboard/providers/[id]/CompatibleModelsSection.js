@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Button } from "@/shared/components";
 import { getProviderCustomModelRows } from "@/shared/utils/providerCustomModels";
-function CompatibleModelRow({ modelId, fullModel, copied, onCopy, onDeleteAlias, onTest, testStatus, isTesting }) {
+function CompatibleModelRow({ modelId, fullModel, copied, onCopy, onDeleteAlias, onTest, testStatus, isTesting, onDisable }) {
   const borderColor = testStatus === "ok"
     ? "border-green-500/40"
     : testStatus === "error"
@@ -59,6 +59,15 @@ function CompatibleModelRow({ modelId, fullModel, copied, onCopy, onDeleteAlias,
           )}
         </div>
       </div>
+      {onDisable && (
+        <button
+          onClick={onDisable}
+          className="p-1 hover:bg-sidebar rounded text-text-muted"
+          title="Disable model"
+        >
+          <span className="material-symbols-outlined text-sm">visibility_off</span>
+        </button>
+      )}
       <button
         onClick={onDeleteAlias}
         className="p-1 hover:bg-red-50 rounded text-red-500"
@@ -70,15 +79,19 @@ function CompatibleModelRow({ modelId, fullModel, copied, onCopy, onDeleteAlias,
   );
 }
 
-export default function CompatibleModelsSection({ providerStorageAlias, providerDisplayAlias, modelAliases, customModels, copied, onCopy, onDeleteAlias, onAddCustomModel, onDeleteCustomModel, connections, isAnthropic }) {
+export default function CompatibleModelsSection({ providerStorageAlias, providerDisplayAlias, modelAliases, customModels, copied, onCopy, onDeleteAlias, onAddCustomModel, onDeleteCustomModel, onDisableModel, onEnableModel, disabledModelIds, connections, isAnthropic }) {
   const [newModel, setNewModel] = useState("");
   const [adding, setAdding] = useState(false);
   const [importing, setImporting] = useState(false);
   const [testingModelId, setTestingModelId] = useState(null);
   const [modelTestResults, setModelTestResults] = useState({});
+  const [batchTesting, setBatchTesting] = useState(false);
+  const [batchProgress, setBatchProgress] = useState(null);
+  const [autoDisableFailed, setAutoDisableFailed] = useState(false);
+  const stopBatchRef = useRef(false);
 
   const handleTestModel = async (modelId) => {
-    if (testingModelId) return;
+    if (testingModelId || batchTesting) return;
     setTestingModelId(modelId);
     try {
       const res = await fetch("/api/models/test", {
@@ -101,6 +114,9 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
     providerAlias: providerStorageAlias,
     type: "llm",
   });
+  const disabledSet = new Set(disabledModelIds || []);
+  const activeModels = allModels.filter((m) => !disabledSet.has(m.id));
+  const disabledModels = allModels.filter((m) => disabledSet.has(m.id));
 
   const handleAdd = async () => {
     if (!newModel.trim() || adding) return;
@@ -157,6 +173,39 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
     }
   };
 
+  const handleBatchTest = async () => {
+    if (batchTesting || activeModels.length === 0) return;
+    stopBatchRef.current = false;
+    setBatchTesting(true);
+    setBatchProgress({ done: 0, total: activeModels.length, ok: 0, failed: 0 });
+    let ok = 0;
+    let failed = 0;
+    for (let i = 0; i < activeModels.length; i++) {
+      if (stopBatchRef.current) break;
+      const { id } = activeModels[i];
+      try {
+        const res = await fetch("/api/models/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: `${providerStorageAlias}/${id}` }),
+        });
+        const data = await res.json();
+        if (data.ok) ok += 1;
+        else {
+          failed += 1;
+          if (autoDisableFailed && onDisableModel) await onDisableModel(id);
+        }
+        setModelTestResults((prev) => ({ ...prev, [id]: data.ok ? "ok" : "error" }));
+      } catch {
+        failed += 1;
+        if (autoDisableFailed && onDisableModel) await onDisableModel(id);
+        setModelTestResults((prev) => ({ ...prev, [id]: "error" }));
+      }
+      setBatchProgress({ done: i + 1, total: activeModels.length, ok, failed });
+    }
+    setBatchTesting(false);
+  };
+
   const canImport = connections.some((conn) => conn.isActive !== false);
 
   return (
@@ -184,6 +233,34 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
         <Button size="sm" variant="secondary" icon="download" onClick={handleImport} disabled={!canImport || importing}>
           {importing ? "Importing..." : "Import from /models"}
         </Button>
+        {allModels.length > 0 && (
+          <Button
+            size="sm"
+            variant="secondary"
+            icon={batchTesting ? "stop" : "science"}
+            loading={batchTesting}
+            onClick={batchTesting ? () => { stopBatchRef.current = true; } : handleBatchTest}
+          >
+            {batchTesting ? "Stop" : "Test All Models"}
+          </Button>
+        )}
+        {/* ponytail: batch test hits every model including disabled ones; skip them once restore flow needs it */}
+        {batchTesting && batchProgress && (
+          <span className="text-xs text-text-muted pb-1.5">
+            {batchProgress.done}/{batchProgress.total} — {batchProgress.ok} ok, {batchProgress.failed} error
+          </span>
+        )}
+        {activeModels.length > 0 && onDisableModel && (
+          <label className="flex items-center gap-1.5 text-xs text-text-muted cursor-pointer pb-1.5 whitespace-nowrap">
+            <input
+              type="checkbox"
+              checked={autoDisableFailed}
+              onChange={(e) => setAutoDisableFailed(e.target.checked)}
+              className="accent-[var(--color-primary)]"
+            />
+            Auto-disable failed
+          </label>
+        )}
       </div>
 
       {!canImport && (
@@ -192,9 +269,9 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
         </p>
       )}
 
-      {allModels.length > 0 && (
+      {activeModels.length > 0 && (
         <div className="flex flex-col gap-3">
-          {allModels.map(({ id, alias, source }) => (
+          {activeModels.map(({ id, alias, source }) => (
             <CompatibleModelRow
               key={`${source}-${providerStorageAlias}/${id}`}
               modelId={id}
@@ -205,8 +282,28 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
               onTest={connections.length > 0 ? () => handleTestModel(id) : undefined}
               testStatus={modelTestResults[id]}
               isTesting={testingModelId === id}
+              onDisable={onDisableModel ? () => onDisableModel(id) : undefined}
             />
           ))}
+        </div>
+      )}
+
+      {disabledModels.length > 0 && (
+        <div className="w-full mt-2">
+          <p className="text-xs text-text-muted mb-2">Disabled models ({disabledModels.length}):</p>
+          <div className="flex flex-wrap gap-2">
+            {disabledModels.map(({ id }) => (
+              <button
+                key={id}
+                onClick={() => onEnableModel(id)}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-dashed border-black/10 dark:border-white/10 text-xs text-text-muted hover:text-primary hover:border-primary/40 hover:bg-primary/5 transition-colors"
+                title="Restore model"
+              >
+                <span className="material-symbols-outlined text-[13px]">add</span>
+                {id}
+              </button>
+            ))}
+          </div>
         </div>
       )}
     </div>
